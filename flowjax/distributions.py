@@ -503,6 +503,38 @@ class Uniform(AbstractLocScaleDistribution):
         return unwrapped.loc + unwrapped.scale
 
 
+def TorusUniform(dim: int) -> Uniform:
+    """Create a uniform distribution on the D-dimensional torus [0, 2π]^D.
+
+    This is a convenience function that returns a Uniform distribution with
+    minval=0 and maxval=2π in each dimension. This serves as the base distribution
+    for normalizing flows on tori.
+
+    Args:
+        dim: Dimension of the torus.
+
+    Returns:
+        Uniform distribution on [0, 2π]^dim.
+
+    Example:
+        .. doctest::
+
+            >>> from flowjax.distributions import TorusUniform
+            >>> import jax.numpy as jnp
+            >>> torus = TorusUniform(3)
+            >>> torus.shape
+            (3,)
+            >>> jnp.allclose(torus.minval, 0)
+            Array(True, dtype=bool)
+            >>> jnp.allclose(torus.maxval, 2 * jnp.pi)
+            Array(True, dtype=bool)
+    """
+    return Uniform(
+        minval=jnp.zeros(dim),
+        maxval=jnp.full(dim, 2 * jnp.pi),
+    )
+
+
 class _StandardGumbel(AbstractDistribution):
     """Standard gumbel distribution."""
 
