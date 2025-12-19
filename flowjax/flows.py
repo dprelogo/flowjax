@@ -23,6 +23,9 @@ from flowjax.bijections import (
     Affine,
     BlockAutoregressiveNetwork,
     Chain,
+    CircularCoupling,
+    CircularMaskedAutoregressive,
+    CircularRationalQuadraticSpline,
     Coupling,
     Flip,
     Invert,
@@ -339,6 +342,134 @@ def triangular_spline_flow(
 
         bijection = Chain(bijections)
         return _add_default_permute(bijection, dim, perm_key)
+
+    keys = jr.split(key, flow_layers)
+    layers = eqx.filter_vmap(make_layer)(keys)
+    bijection = Invert(Scan(layers)) if invert else Scan(layers)
+    return Transformed(base_dist, bijection)
+
+
+def circular_coupling_flow(
+    key: PRNGKeyArray,
+    *,
+    base_dist: AbstractDistribution,
+    transformer: AbstractBijection | None = None,
+    cond_dim: int | None = None,
+    flow_layers: int = 8,
+    nn_width: int = 50,
+    nn_depth: int = 1,
+    nn_activation: Callable = jnn.relu,
+    num_bins: int = 8,
+    invert: bool = True,
+) -> Transformed:
+    """Coupling flow for circular/toroidal domains.
+
+    Uses :class:`~flowjax.bijections.CircularCoupling` layers with periodic
+    (cos, sin) embeddings to respect the circular topology. The default transformer
+    is :class:`~flowjax.bijections.CircularRationalQuadraticSpline`, which implements
+    a circle diffeomorphism.
+
+    Refs:
+        - https://arxiv.org/abs/2002.02428 (Normalizing Flows on Tori and Spheres)
+        - https://arxiv.org/abs/1605.08803 (RealNVP)
+
+    Args:
+        key: Jax random key.
+        base_dist: Base distribution on the torus, with ``base_dist.ndim==1``.
+            Typically ``TorusUniform(dim)`` for uniform distribution on [0, 2π]^D.
+        transformer: Scalar bijection (shape=()) to be parameterised by conditioner.
+            Defaults to :class:`~flowjax.bijections.CircularRationalQuadraticSpline`.
+        cond_dim: Dimension of external conditioning variables. Defaults to None.
+        flow_layers: Number of coupling layers. Defaults to 8.
+        nn_width: Conditioner hidden layer size. Defaults to 50.
+        nn_depth: Conditioner depth. Defaults to 1.
+        nn_activation: Conditioner activation function. Defaults to jnn.relu.
+        num_bins: Number of spline bins (only used if transformer is None). Defaults to 8.
+        invert: Whether to invert the bijection. True prioritises faster `log_prob`,
+            False prioritises faster `sample`. Defaults to True.
+    """
+    if transformer is None:
+        transformer = CircularRationalQuadraticSpline(num_bins=num_bins)
+
+    dim = base_dist.shape[-1]
+
+    def make_layer(key):  # circular coupling layer + flip
+        bijection = CircularCoupling(
+            key=key,
+            transformer=transformer,
+            untransformed_dim=dim // 2,
+            dim=dim,
+            cond_dim=cond_dim,
+            nn_width=nn_width,
+            nn_depth=nn_depth,
+            nn_activation=nn_activation,
+        )
+        # Use Flip for circular domains (deterministic, preserves topology)
+        return Chain([bijection, Flip((dim,))]).merge_chains()
+
+    keys = jr.split(key, flow_layers)
+    layers = eqx.filter_vmap(make_layer)(keys)
+    bijection = Invert(Scan(layers)) if invert else Scan(layers)
+    return Transformed(base_dist, bijection)
+
+
+def circular_masked_autoregressive_flow(
+    key: PRNGKeyArray,
+    *,
+    base_dist: AbstractDistribution,
+    transformer: AbstractBijection | None = None,
+    cond_dim: int | None = None,
+    flow_layers: int = 8,
+    nn_width: int = 50,
+    nn_depth: int = 1,
+    nn_activation: Callable = jnn.relu,
+    num_bins: int = 8,
+    invert: bool = True,
+) -> Transformed:
+    """Masked autoregressive flow for circular/toroidal domains.
+
+    Uses :class:`~flowjax.bijections.CircularMaskedAutoregressive` layers with
+    periodic (cos, sin) embeddings. Input angles are embedded as interleaved
+    (cos θᵢ, sin θᵢ) pairs with grouped ranks to ensure proper autoregressive
+    masking that respects circularity.
+
+    Refs:
+        - https://arxiv.org/abs/2002.02428 (Normalizing Flows on Tori and Spheres)
+        - https://arxiv.org/abs/1705.07057 (Masked Autoregressive Flow)
+
+    Args:
+        key: Jax random key.
+        base_dist: Base distribution on the torus, with ``base_dist.ndim==1``.
+            Typically ``TorusUniform(dim)`` for uniform distribution on [0, 2π]^D.
+        transformer: Scalar bijection (shape=()) to be parameterised by the
+            autoregressive network. Defaults to
+            :class:`~flowjax.bijections.CircularRationalQuadraticSpline`.
+        cond_dim: Dimension of external conditioning variables. Defaults to None.
+        flow_layers: Number of MAF layers. Defaults to 8.
+        nn_width: Hidden layer size in the masked autoregressive network. Defaults to 50.
+        nn_depth: Depth of the masked autoregressive network. Defaults to 1.
+        nn_activation: Activation function. Defaults to jnn.relu.
+        num_bins: Number of spline bins (only used if transformer is None). Defaults to 8.
+        invert: Whether to invert the bijection. True prioritises faster `log_prob`,
+            False prioritises faster `sample`. Defaults to True.
+    """
+    if transformer is None:
+        transformer = CircularRationalQuadraticSpline(num_bins=num_bins)
+
+    dim = base_dist.shape[-1]
+
+    def make_layer(key):  # circular MAF layer + flip
+        bijection = CircularMaskedAutoregressive(
+            key=key,
+            transformer=transformer,
+            dim=dim,
+            cond_dim=cond_dim,
+            nn_width=nn_width,
+            nn_depth=nn_depth,
+            nn_activation=nn_activation,
+        )
+        # Use Flip for circular domains (deterministic, preserves topology)
+        return Chain([bijection, Flip((dim,))]).merge_chains()
 
     keys = jr.split(key, flow_layers)
     layers = eqx.filter_vmap(make_layer)(keys)
