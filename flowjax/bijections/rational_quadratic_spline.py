@@ -196,12 +196,17 @@ class RationalQuadraticSpline(AbstractBijection):
             output, e.g. 0=no adjustment, 1=average softmax output with evenly spaced
             widths, >1 promotes more evenly spaced widths. See
             ``real_to_increasing_on_interval``. Defaults to 1e-2.
+        boundary_derivatives: If set, fixes the boundary derivatives to this value
+            instead of learning them. For identity tails (outside the interval),
+            this should be 1.0 to ensure C1 continuity. If None, all derivatives
+            are learned. Defaults to None for backward compatibility.
     """
 
     knots: int
     interval: tuple[int | float, int | float]
     softmax_adjust: float | int
     min_derivative: float
+    boundary_derivatives: float | None
     x_pos: Array | AbstractUnwrappable[Array]
     y_pos: Array | AbstractUnwrappable[Array]
     derivatives: Array | AbstractUnwrappable[Array]
@@ -215,12 +220,14 @@ class RationalQuadraticSpline(AbstractBijection):
         interval: float | int | tuple[int | float, int | float],
         min_derivative: float = 1e-3,
         softmax_adjust: float | int = 1e-2,
+        boundary_derivatives: float | None = None,
     ):
         self.knots = knots
         interval = interval if isinstance(interval, tuple) else (-interval, interval)
         self.interval = interval
         self.softmax_adjust = softmax_adjust
         self.min_derivative = min_derivative
+        self.boundary_derivatives = boundary_derivatives
 
         to_interval = jnp.vectorize(
             partial(
@@ -233,14 +240,32 @@ class RationalQuadraticSpline(AbstractBijection):
 
         self.x_pos = Parameterize(to_interval, jnp.zeros(knots))
         self.y_pos = Parameterize(to_interval, jnp.zeros(knots))
-        self.derivatives = Parameterize(
-            lambda arr: jax.nn.softplus(arr) + min_derivative,
-            jnp.full(knots + 2, inv_softplus(1 - min_derivative)),
-        )
+
+        if boundary_derivatives is not None:
+            # Fix boundary derivatives, only learn internal derivatives
+            self.derivatives = Parameterize(
+                lambda arr: jax.nn.softplus(arr) + min_derivative,
+                jnp.full(knots, inv_softplus(1 - min_derivative)),
+            )
+        else:
+            # Original behavior: learn all derivatives including boundaries
+            self.derivatives = Parameterize(
+                lambda arr: jax.nn.softplus(arr) + min_derivative,
+                jnp.full(knots + 2, inv_softplus(1 - min_derivative)),
+            )
+
+    def _get_derivatives(self) -> Array:
+        """Get the full derivatives array, padding with boundary values if needed."""
+        if self.boundary_derivatives is not None:
+            # Pad learned internal derivatives with fixed boundary values
+            pad = jnp.array([self.boundary_derivatives])
+            return jnp.concatenate([pad, self.derivatives, pad])
+        return self.derivatives
 
     def transform_and_log_det(self, x, condition=None):
         # Following notation from the paper
-        x_pos, y_pos, derivatives = self.x_pos, self.y_pos, self.derivatives
+        x_pos, y_pos = self.x_pos, self.y_pos
+        derivatives = self._get_derivatives()
         in_bounds = jnp.logical_and(x >= self.interval[0], x <= self.interval[1])
         x_robust = jnp.where(in_bounds, x, 0)  # To avoid nans
         k = jnp.searchsorted(x_pos, x_robust) - 1  # k is bin number
@@ -259,7 +284,8 @@ class RationalQuadraticSpline(AbstractBijection):
 
     def inverse_and_log_det(self, y, condition=None):
         # Following notation from the paper
-        x_pos, y_pos, derivatives = self.x_pos, self.y_pos, self.derivatives
+        x_pos, y_pos = self.x_pos, self.y_pos
+        derivatives = self._get_derivatives()
         in_bounds = jnp.logical_and(y >= self.interval[0], y <= self.interval[1])
         y_robust = jnp.where(in_bounds, y, 0)  # To avoid nans
         k = jnp.searchsorted(y_pos, y_robust) - 1
@@ -284,7 +310,8 @@ class RationalQuadraticSpline(AbstractBijection):
     def derivative(self, x) -> Array:
         """The derivative dy/dx of the forward transformation."""
         # Following notation from the paper (eq. 5)
-        x_pos, y_pos, derivatives = self.x_pos, self.y_pos, self.derivatives
+        x_pos, y_pos = self.x_pos, self.y_pos
+        derivatives = self._get_derivatives()
         in_bounds = jnp.logical_and(x >= self.interval[0], x <= self.interval[1])
         x_robust = jnp.where(in_bounds, x, 0)  # To avoid nans
         k = jnp.searchsorted(x_pos, x_robust) - 1
