@@ -14,6 +14,7 @@ from equinox.nn import Linear
 from jax.nn import softplus
 from jax.nn.initializers import glorot_uniform
 from jaxtyping import Array, PRNGKeyArray
+import paramax
 from paramax import Parameterize, WeightNormalization
 from paramax.utils import inv_softplus
 
@@ -31,6 +32,7 @@ from flowjax.bijections import (
     Invert,
     LeakyTanh,
     MaskedAutoregressive,
+    MixedMaskedAutoregressive,
     NumericalInverse,
     Permute,
     Planar,
@@ -45,6 +47,7 @@ from flowjax.root_finding import (
     bisect_check_expand_search,
     root_finder_to_inverter,
 )
+from flowjax.utils import get_ravelled_pytree_constructor
 
 
 def _affine_with_min_scale(min_scale: float = 1e-2) -> Affine:
@@ -474,6 +477,196 @@ def circular_masked_autoregressive_flow(
     keys = jr.split(key, flow_layers)
     layers = eqx.filter_vmap(make_layer)(keys)
     bijection = Invert(Scan(layers)) if invert else Scan(layers)
+    return Transformed(base_dist, bijection)
+
+
+def mixed_masked_autoregressive_flow(
+    key: PRNGKeyArray,
+    *,
+    base_dist: AbstractDistribution,
+    is_circular: Array,
+    linear_bounds: tuple[float, float] = (-5.0, 5.0),
+    linear_transformer_kwargs: dict | None = None,
+    circular_transformer_kwargs: dict | None = None,
+    cond_dim: int | None = None,
+    flow_layers: int = 8,
+    nn_width: int = 50,
+    nn_depth: int = 1,
+    nn_activation: Callable = jnn.relu,
+    invert: bool = True,
+) -> Transformed:
+    """Masked autoregressive flow for mixed R^N × T^M topologies.
+
+    Creates flows that can model joint distributions on product spaces combining
+    Euclidean (R^N) and toroidal (T^M) dimensions. Uses different transformers
+    for each topology type while maintaining autoregressive structure with
+    mixed embeddings.
+
+    Based on "Normalizing Flows on Tori and Spheres" (Rezende et al., 2020):
+    "More generally, autoregressive flows can be applied in the same way on any
+    manifold that can be written as a Cartesian product of circles and intervals."
+
+    Key features:
+    - Mixed embedding: identity for linear dims, (cos θ, sin θ) for circular dims
+    - Interleaved embedding order preserves dimension ordering for causal structure
+    - Topology-aware parameter routing using MixedTransformer
+    - Full permutation with topology tracking for maximum expressivity
+    - Automatic bounds matching between base distribution and transformers
+
+    Note on dimension ordering:
+        The flow respects your input dimension ordering. For correlated distributions
+        where one variable depends on another (e.g., r = f(θ)), you should order
+        dimensions so that conditioning variables come first. In autoregressive flows,
+        dimension i is conditioned on dimensions 0, 1, ..., i-1.
+
+    Args:
+        key: Jax random key.
+        base_dist: Base distribution with shape matching dimension count.
+            **Recommended**: Use ``MixedBase(is_circular)`` for numerical stability
+            (StandardNormal for R dims, Uniform for T dims). ``MixedUniform`` may
+            cause ``-inf`` log_prob when samples map slightly outside bounds.
+        is_circular: Boolean array indicating which dimensions are circular.
+            Length must match base_dist.shape[-1].
+        linear_bounds: Bounds for linear dimensions (used in RationalQuadraticSpline).
+            Defaults to (-5.0, 5.0).
+        linear_transformer_kwargs: Additional kwargs for linear transformers
+            (RationalQuadraticSpline). Defaults to None.
+        circular_transformer_kwargs: Additional kwargs for circular transformers
+            (CircularRationalQuadraticSpline). Defaults to None.
+        cond_dim: Dimension of external conditioning variables. Defaults to None.
+        flow_layers: Number of mixed MAF layers. Defaults to 8.
+        nn_width: Hidden layer size in autoregressive networks. Defaults to 50.
+        nn_depth: Depth of autoregressive networks. Defaults to 1.
+        nn_activation: Activation function. Defaults to jnn.relu.
+        invert: Whether to invert the bijection. True prioritises faster log_prob,
+            False prioritises faster sample. Defaults to True.
+
+    Returns:
+        Transformed distribution implementing mixed topology normalizing flow.
+
+    Example:
+        >>> import jax.random as jr
+        >>> from flowjax.flows import mixed_masked_autoregressive_flow
+        >>> from flowjax.distributions import MixedBase
+        >>>
+        >>> # Create R^2 × T^1 flow (2 linear, 1 circular dimension)
+        >>> key = jr.key(0)
+        >>> is_circular = jnp.array([False, False, True])  # [R, R, T]
+        >>> base_dist = MixedBase(is_circular)  # Recommended for numerical stability
+        >>> flow = mixed_masked_autoregressive_flow(
+        ...     key, base_dist=base_dist, is_circular=is_circular
+        ... )
+    """
+    is_circular = jnp.asarray(is_circular, dtype=bool)
+    dim = base_dist.shape[-1]
+
+    if len(is_circular) != dim:
+        raise ValueError(f"is_circular length {len(is_circular)} != dim {dim}")
+
+    # Default transformer kwargs
+    linear_kwargs = linear_transformer_kwargs or {"knots": 8}
+    circular_kwargs = circular_transformer_kwargs or {"num_bins": 8}
+
+    # Create sample transformers ONCE to build constructors
+    # Critical: boundary_derivatives=1.0 ensures C1 continuity with identity tails
+    # Without this, the spline has derivative discontinuities at the interval boundaries,
+    # causing gradient explosions when data sweeps across boundaries (e.g., correlated examples)
+    linear_sample = RationalQuadraticSpline(
+        interval=linear_bounds, boundary_derivatives=1.0, **linear_kwargs
+    )
+    circular_sample = CircularRationalQuadraticSpline(**circular_kwargs)
+
+    # Build constructors ONCE outside the factory closures (critical for performance)
+    # This avoids expensive PyTree traversal on every factory call during tracing
+    filter_spec = eqx.is_inexact_array
+    is_leaf = lambda leaf: isinstance(leaf, paramax.NonTrainable)
+
+    linear_constructor, _ = get_ravelled_pytree_constructor(
+        linear_sample, filter_spec=filter_spec, is_leaf=is_leaf
+    )
+    circular_constructor, _ = get_ravelled_pytree_constructor(
+        circular_sample, filter_spec=filter_spec, is_leaf=is_leaf
+    )
+
+    # Factories are now simple wrappers around pre-computed constructors
+    def linear_transformer_factory(params: Array) -> AbstractBijection:
+        """Factory function that creates RQS transformer from flat parameters."""
+        return linear_constructor(params)
+
+    def circular_transformer_factory(params: Array) -> AbstractBijection:
+        """Factory function that creates CRQS transformer from flat parameters."""
+        return circular_constructor(params)
+
+    # Track topology mask across layers for full permutation strategy
+    # Use original user-specified order to respect causal structure
+    current_mask = is_circular
+
+    def make_layer(layer_data):
+        """Create Mixed MAF layer + permutation with topology tracking."""
+        layer_key, current_topology = layer_data
+        bij_key, perm_key = jr.split(layer_key)
+
+        # Create Mixed MAF bijection using current topology configuration
+        bijection = MixedMaskedAutoregressive(
+            key=bij_key,
+            is_circular=current_topology,
+            dim=dim,
+            linear_transformer_factory=linear_transformer_factory,
+            circular_transformer_factory=circular_transformer_factory,
+            linear_bounds=linear_bounds,
+            cond_dim=cond_dim,
+            nn_width=nn_width,
+            nn_depth=nn_depth,
+            nn_activation=nn_activation,
+            **{**linear_kwargs, **circular_kwargs}
+        )
+
+        # Add permutation (except for last layer handled separately)
+        if dim > 1:
+            perm_indices = jr.permutation(perm_key, jnp.arange(dim))
+            perm = Permute(perm_indices)
+            # Update topology mask for next layer
+            next_topology = current_topology[perm_indices]
+            return Chain([bijection, perm]).merge_chains(), next_topology
+        else:
+            return bijection, current_topology
+
+    # Create layer data: (key, topology_mask) pairs
+    keys = jr.split(key, flow_layers)
+
+    # Build layers sequentially to track topology evolution
+    layers = []
+    topology_masks = [current_mask]
+
+    for i, layer_key in enumerate(keys):
+        current_topology = topology_masks[-1]
+
+        # For last layer, don't add random permutation
+        if i == flow_layers - 1:
+            bijection = MixedMaskedAutoregressive(
+                key=layer_key,
+                is_circular=current_topology,
+                dim=dim,
+                linear_transformer_factory=linear_transformer_factory,
+                circular_transformer_factory=circular_transformer_factory,
+                linear_bounds=linear_bounds,
+                cond_dim=cond_dim,
+                nn_width=nn_width,
+                nn_depth=nn_depth,
+                nn_activation=nn_activation,
+                **{**linear_kwargs, **circular_kwargs}
+            )
+            layers.append(bijection)
+        else:
+            layer, next_topology = make_layer((layer_key, current_topology))
+            layers.append(layer)
+            topology_masks.append(next_topology)
+
+    # Chain all layers
+    bijection = Chain(layers) if len(layers) > 1 else layers[0]
+    if invert:
+        bijection = Invert(bijection)
+
     return Transformed(base_dist, bijection)
 
 

@@ -13,6 +13,8 @@ from .coupling import Coupling
 from .exp import Exp
 from .jax_transforms import Scan, Vmap
 from .masked_autoregressive import MaskedAutoregressive
+from .mixed_masked_autoregressive import MixedMaskedAutoregressive
+from .mixed_transformer import MixedTransformer
 from .orthogonal import DiscreteCosine, Householder
 from .planar import Planar
 from .power import Power
@@ -54,6 +56,8 @@ __all__ = [
     "LeakyTanh",
     "Loc",
     "MaskedAutoregressive",
+    "MixedMaskedAutoregressive",
+    "MixedTransformer",
     "Indexed",
     "Permute",
     "Power",
