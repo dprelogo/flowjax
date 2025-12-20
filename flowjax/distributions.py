@@ -535,6 +535,167 @@ def TorusUniform(dim: int) -> Uniform:
     )
 
 
+def MixedUniform(
+    is_circular: ArrayLike,
+    linear_bounds: tuple[float, float] = (-5.0, 5.0),
+) -> Uniform:
+    """Create uniform distribution on mixed R^N × T^M topology.
+
+    .. warning::
+        **Numerical Stability**: Using ``MixedUniform`` with identity-tail splines
+        (the default in ``mixed_masked_autoregressive_flow``) may result in ``-inf``
+        log_prob values if numerical error pushes transformed samples slightly outside
+        bounds. For better numerical stability, use :class:`MixedBase` instead, which
+        uses StandardNormal for linear dimensions (unbounded support).
+
+    This creates a uniform distribution where linear dimensions use the specified
+    bounds and circular dimensions use [0, 2π]. This serves as the base distribution
+    for mixed topology normalizing flows.
+
+    The bounds for linear and circular dimensions must be coordinated with the
+    transformer intervals used in the flows to ensure consistency.
+
+    Args:
+        is_circular: Boolean array indicating which dimensions are circular.
+            Length determines the total dimensionality.
+        linear_bounds: Bounds (min, max) for linear dimensions.
+            Defaults to (-5.0, 5.0).
+
+    Returns:
+        Uniform distribution on the mixed topology space.
+
+    Example:
+        .. doctest::
+
+            >>> from flowjax.distributions import MixedUniform
+            >>> import jax.numpy as jnp
+            >>>
+            >>> # Create R^2 × T^1 distribution (2 linear, 1 circular)
+            >>> is_circular = jnp.array([False, False, True])
+            >>> dist = MixedUniform(is_circular, linear_bounds=(-3.0, 3.0))
+            >>> dist.shape
+            (3,)
+            >>> dist.minval  # [r_min, r_min, 0]
+            Array([-3., -3.,  0.], dtype=float32)
+            >>> dist.maxval  # [r_max, r_max, 2π]
+            Array([3.    , 3.    , 6.2832], dtype=float32)
+    """
+    is_circular = jnp.asarray(is_circular, dtype=bool)
+    dim = len(is_circular)
+
+    # Create minval and maxval arrays
+    minval = jnp.zeros(dim)
+    maxval = jnp.zeros(dim)
+
+    # Set bounds for linear dimensions
+    linear_min, linear_max = linear_bounds
+    minval = minval.at[~is_circular].set(linear_min)
+    maxval = maxval.at[~is_circular].set(linear_max)
+
+    # Set bounds for circular dimensions [0, 2π]
+    minval = minval.at[is_circular].set(0.0)
+    maxval = maxval.at[is_circular].set(2 * jnp.pi)
+
+    return Uniform(minval=minval, maxval=maxval)
+
+
+class MixedBase(AbstractDistribution):
+    """Mixed base distribution for R^N × T^M topology with proper support.
+
+    Uses StandardNormal for linear (R) dimensions and Uniform[0, 2π] for
+    circular (T) dimensions. This provides proper unbounded support for
+    linear dimensions, avoiding the numerical stability issues that arise
+    when using bounded Uniform with identity-tail splines.
+
+    The key insight is that for normalizing flows with RationalQuadraticSpline
+    transformers, the spline acts as identity outside its defined interval.
+    If the base distribution is bounded (like Uniform), samples that map
+    slightly outside the bounds get -inf log_prob. Using StandardNormal
+    for linear dimensions avoids this issue since it has unbounded support.
+
+    Args:
+        is_circular: Boolean array indicating which dimensions are circular.
+            Length determines the total dimensionality.
+
+    Example:
+        .. doctest::
+
+            >>> from flowjax.distributions import MixedBase
+            >>> import jax.numpy as jnp
+            >>>
+            >>> # Create R^1 × T^1 distribution (1 linear, 1 circular)
+            >>> is_circular = jnp.array([False, True])
+            >>> dist = MixedBase(is_circular)
+            >>> dist.shape
+            (2,)
+    """
+
+    is_circular: Array
+    shape: tuple[int, ...]
+    cond_shape: ClassVar[None] = None
+    _n_linear: int
+    _n_circular: int
+    _linear_indices: Array
+    _circular_indices: Array
+
+    def __init__(self, is_circular: ArrayLike):
+        self.is_circular = jnp.asarray(is_circular, dtype=bool)
+        self.shape = (len(self.is_circular),)
+
+        # Pre-compute indices for efficiency
+        self._linear_indices = jnp.where(~self.is_circular)[0]
+        self._circular_indices = jnp.where(self.is_circular)[0]
+        self._n_linear = len(self._linear_indices)
+        self._n_circular = len(self._circular_indices)
+
+    def _log_prob(self, x: Array, condition: Array | None = None) -> Array:
+        """Compute log probability for mixed topology sample."""
+        total_log_prob = jnp.array(0.0)
+
+        # Linear dimensions: Standard Normal log prob
+        if self._n_linear > 0:
+            x_linear = x[self._linear_indices]
+            # Standard normal: log p(x) = -0.5 * x^2 - 0.5 * log(2π)
+            lp_linear = jstats.norm.logpdf(x_linear).sum()
+            total_log_prob = total_log_prob + lp_linear
+
+        # Circular dimensions: Uniform[0, 2π] log prob
+        # The circular dimensions are periodic, so we wrap values to [0, 2π)
+        # before checking bounds. This handles cases where the flow maps
+        # values slightly outside the canonical range due to numerical issues.
+        if self._n_circular > 0:
+            x_circular = x[self._circular_indices]
+            # Wrap to [0, 2π) to handle periodicity
+            x_circular_wrapped = x_circular % (2 * jnp.pi)
+            # Uniform log prob = -log(2π) per dimension
+            # Always valid since we wrapped the values
+            lp_circular = -self._n_circular * jnp.log(2 * jnp.pi)
+            total_log_prob = total_log_prob + lp_circular
+
+        return total_log_prob
+
+    def _sample(self, key: PRNGKeyArray, condition: Array | None = None) -> Array:
+        """Sample from the mixed topology distribution."""
+        key_linear, key_circular = jr.split(key)
+
+        # Initialize output
+        z = jnp.zeros(self.shape)
+
+        # Sample linear dimensions from Standard Normal
+        if self._n_linear > 0:
+            z_linear = jr.normal(key_linear, (self._n_linear,))
+            z = z.at[self._linear_indices].set(z_linear)
+
+        # Sample circular dimensions from Uniform[0, 2π]
+        if self._n_circular > 0:
+            z_circular = jr.uniform(
+                key_circular, (self._n_circular,), minval=0.0, maxval=2 * jnp.pi
+            )
+            z = z.at[self._circular_indices].set(z_circular)
+
+        return z
+
+
 class _StandardGumbel(AbstractDistribution):
     """Standard gumbel distribution."""
 
