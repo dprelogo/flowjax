@@ -50,3 +50,4 @@ _build
 articles/*
 CLAUDE.md
 .mcp*
+*.png
