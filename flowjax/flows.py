@@ -486,6 +486,7 @@ def mixed_masked_autoregressive_flow(
     base_dist: AbstractDistribution,
     is_circular: Array,
     linear_bounds: tuple[float, float] = (-5.0, 5.0),
+    linear_boundary_derivatives: float | None = 1.0,
     linear_transformer_kwargs: dict | None = None,
     circular_transformer_kwargs: dict | None = None,
     cond_dim: int | None = None,
@@ -529,6 +530,9 @@ def mixed_masked_autoregressive_flow(
             Length must match base_dist.shape[-1].
         linear_bounds: Bounds for linear dimensions (used in RationalQuadraticSpline).
             Defaults to (-5.0, 5.0).
+        linear_boundary_derivatives: Fixed boundary derivative value for linear
+            transformers. Use 1.0 for C1 continuity with identity tails (default),
+            or None to learn boundary derivatives freely. Defaults to 1.0.
         linear_transformer_kwargs: Additional kwargs for linear transformers
             (RationalQuadraticSpline). Defaults to None.
         circular_transformer_kwargs: Additional kwargs for circular transformers
@@ -568,11 +572,13 @@ def mixed_masked_autoregressive_flow(
     circular_kwargs = circular_transformer_kwargs or {"num_bins": 8}
 
     # Create sample transformers ONCE to build constructors
-    # Critical: boundary_derivatives=1.0 ensures C1 continuity with identity tails
-    # Without this, the spline has derivative discontinuities at the interval boundaries,
-    # causing gradient explosions when data sweeps across boundaries (e.g., correlated examples)
+    # boundary_derivatives=1.0 (default) ensures C1 continuity with identity tails
+    # Use boundary_derivatives=None to learn boundary derivatives freely (useful for
+    # bounded distributions like Uniform[0,1] where identity tails aren't needed)
     linear_sample = RationalQuadraticSpline(
-        interval=linear_bounds, boundary_derivatives=1.0, **linear_kwargs
+        interval=linear_bounds,
+        boundary_derivatives=linear_boundary_derivatives,
+        **linear_kwargs,
     )
     circular_sample = CircularRationalQuadraticSpline(**circular_kwargs)
 
@@ -607,6 +613,13 @@ def mixed_masked_autoregressive_flow(
         bij_key, perm_key = jr.split(layer_key)
 
         # Create Mixed MAF bijection using current topology configuration
+        # Include boundary_derivatives in kwargs so MixedMaskedAutoregressive
+        # computes correct parameter count in _get_linear_param_count
+        transformer_kwargs = {
+            **linear_kwargs,
+            **circular_kwargs,
+            "boundary_derivatives": linear_boundary_derivatives,
+        }
         bijection = MixedMaskedAutoregressive(
             key=bij_key,
             is_circular=current_topology,
@@ -618,7 +631,7 @@ def mixed_masked_autoregressive_flow(
             nn_width=nn_width,
             nn_depth=nn_depth,
             nn_activation=nn_activation,
-            **{**linear_kwargs, **circular_kwargs}
+            **transformer_kwargs
         )
 
         # Add permutation (except for last layer handled separately)
@@ -643,6 +656,12 @@ def mixed_masked_autoregressive_flow(
 
         # For last layer, don't add random permutation
         if i == flow_layers - 1:
+            # Use same transformer_kwargs as make_layer to ensure consistent param counts
+            last_layer_kwargs = {
+                **linear_kwargs,
+                **circular_kwargs,
+                "boundary_derivatives": linear_boundary_derivatives,
+            }
             bijection = MixedMaskedAutoregressive(
                 key=layer_key,
                 is_circular=current_topology,
@@ -654,7 +673,7 @@ def mixed_masked_autoregressive_flow(
                 nn_width=nn_width,
                 nn_depth=nn_depth,
                 nn_activation=nn_activation,
-                **{**linear_kwargs, **circular_kwargs}
+                **last_layer_kwargs
             )
             layers.append(bijection)
         else:
