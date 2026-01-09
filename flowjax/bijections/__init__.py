@@ -4,11 +4,17 @@ from .affine import AdditiveCondition, Affine, Loc, Scale, TriangularAffine
 from .bijection import AbstractBijection
 from .block_autoregressive_network import BlockAutoregressiveNetwork
 from .chain import Chain
+from .circular_coupling import CircularCoupling
+from .circular_masked_autoregressive import CircularMaskedAutoregressive
+from .circular_rational_quadratic_spline import CircularRationalQuadraticSpline
 from .concatenate import Concatenate, Stack
+from .convex_combination import ConvexCombination
 from .coupling import Coupling
 from .exp import Exp
 from .jax_transforms import Scan, Vmap
 from .masked_autoregressive import MaskedAutoregressive
+from .mixed_masked_autoregressive import MixedMaskedAutoregressive
+from .mixed_transformer import MixedTransformer
 from .orthogonal import DiscreteCosine, Householder
 from .planar import Planar
 from .power import Power
@@ -34,7 +40,11 @@ __all__ = [
     "AbstractBijection",
     "BlockAutoregressiveNetwork",
     "Chain",
+    "CircularCoupling",
+    "CircularMaskedAutoregressive",
+    "CircularRationalQuadraticSpline",
     "Concatenate",
+    "ConvexCombination",
     "Coupling",
     "DiscreteCosine",
     "EmbedCondition",
@@ -46,6 +56,8 @@ __all__ = [
     "LeakyTanh",
     "Loc",
     "MaskedAutoregressive",
+    "MixedMaskedAutoregressive",
+    "MixedTransformer",
     "Indexed",
     "Permute",
     "Power",

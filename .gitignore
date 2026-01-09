@@ -46,3 +46,8 @@ _temp*
 .vscode/settings.json
 _build
 .zed
+
+articles/*
+CLAUDE.md
+.mcp*
+*.png
