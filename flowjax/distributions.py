@@ -696,6 +696,67 @@ class MixedBase(AbstractDistribution):
         return z
 
 
+class MixedUniformBase(AbstractDistribution):
+    """Uniform[0, 1] base distribution for unit hypercube flows with mixed topology.
+
+    This distribution uses Uniform[0, 1] for ALL dimensions (both linear and circular),
+    with topology information stored for use by flows. This is designed for
+    unit hypercube data (e.g., nested sampling output) where circular parameters
+    are already mapped to [0, 1] via prior transforms.
+
+    When used with ``unit_hypercube=True`` in ``mixed_masked_autoregressive_flow``,
+    the flow internally scales circular dimensions to [0, 2π] for proper circular
+    embeddings, then scales back to [0, 1] at output.
+
+    For log_prob, circular dimensions are wrapped to [0, 1) before bounds checking
+    to handle periodicity correctly.
+
+    Args:
+        is_circular: Boolean array indicating which dimensions are circular (True)
+            vs linear (False). Length determines the total dimensionality.
+
+    Example:
+        .. doctest::
+
+            >>> from flowjax.distributions import MixedUniformBase
+            >>> import jax.numpy as jnp
+            >>>
+            >>> # Create unit hypercube distribution (2 circular, 2 linear dims)
+            >>> is_circular = jnp.array([True, True, False, False])
+            >>> dist = MixedUniformBase(is_circular)
+            >>> dist.shape
+            (4,)
+            >>> # Samples will always be in [0, 1] for all dimensions
+    """
+
+    is_circular: Array
+    shape: tuple[int, ...]
+    cond_shape: ClassVar[None] = None
+
+    def __init__(self, is_circular: ArrayLike):
+        self.is_circular = jnp.asarray(is_circular, dtype=bool)
+        self.shape = (len(self.is_circular),)
+
+    def _log_prob(self, x: Array, condition: Array | None = None) -> Array:
+        """Compute log probability for unit hypercube sample.
+
+        Uniform[0, 1] has log_prob = 0 if in bounds, -inf otherwise.
+        Circular dimensions are wrapped to [0, 1) before checking bounds.
+        """
+        # Wrap circular dimensions to [0, 1) to handle periodicity
+        x_wrapped = jnp.where(self.is_circular, x % 1.0, x)
+
+        # Check bounds: all dimensions should be in [0, 1]
+        in_bounds = jnp.all((x_wrapped >= 0.0) & (x_wrapped <= 1.0))
+
+        # Uniform[0, 1]: log_prob = 0 (log(1) = 0 for each dimension)
+        return jnp.where(in_bounds, 0.0, -jnp.inf)
+
+    def _sample(self, key: PRNGKeyArray, condition: Array | None = None) -> Array:
+        """Sample from Uniform[0, 1] for all dimensions."""
+        return jr.uniform(key, self.shape, minval=0.0, maxval=1.0)
+
+
 class _StandardGumbel(AbstractDistribution):
     """Standard gumbel distribution."""
 
