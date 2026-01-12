@@ -302,3 +302,107 @@ def test_transformed_wrong_shape():
             StandardNormal((2,)),
             Affine(),
         )
+
+
+# Import MixedUniformBase for testing
+from flowjax.distributions import MixedUniformBase
+
+
+class TestMixedUniformBase:
+    """Tests for MixedUniformBase distribution."""
+
+    def test_basic_properties(self):
+        """Test basic properties of MixedUniformBase."""
+        is_circular = jnp.array([True, False, True, False])
+        dist = MixedUniformBase(is_circular)
+
+        assert dist.shape == (4,)
+        assert dist.cond_shape is None
+
+    def test_sample_in_unit_interval(self):
+        """Test that samples are in [0, 1] for all dimensions."""
+        is_circular = jnp.array([True, False, True, False])
+        dist = MixedUniformBase(is_circular)
+
+        key = jr.key(0)
+        samples = dist.sample(key, (1000,))
+
+        assert samples.shape == (1000, 4)
+        assert jnp.all(samples >= 0.0)
+        assert jnp.all(samples <= 1.0)
+
+    def test_log_prob_uniform(self):
+        """Test that log prob is uniform (0) inside [0, 1]."""
+        is_circular = jnp.array([True, False, True])
+        dist = MixedUniformBase(is_circular)
+
+        # Points inside [0, 1]
+        x_inside = jnp.array([0.25, 0.5, 0.75])
+        log_p = dist.log_prob(x_inside)
+        assert jnp.allclose(log_p, 0.0)  # Uniform[0,1] has log_prob = 0
+
+    def test_log_prob_outside_bounds_linear(self):
+        """Test that linear dims outside [0, 1] give -inf."""
+        is_circular = jnp.array([True, False, True])  # dim 1 is linear
+        dist = MixedUniformBase(is_circular)
+
+        # Linear dim outside bounds
+        x_outside = jnp.array([0.5, 1.5, 0.5])  # dim 1 = 1.5 > 1
+        log_p = dist.log_prob(x_outside)
+        assert log_p == -jnp.inf
+
+    def test_circular_wrapping(self):
+        """Test that circular dims are wrapped in log_prob."""
+        is_circular = jnp.array([True, False])
+        dist = MixedUniformBase(is_circular)
+
+        # Circular dim outside [0, 1] should wrap
+        x_wrap = jnp.array([1.5, 0.5])  # 1.5 % 1.0 = 0.5, which is in bounds
+        log_p = dist.log_prob(x_wrap)
+        assert jnp.isfinite(log_p)
+        assert jnp.allclose(log_p, 0.0)
+
+    def test_is_circular_stored(self):
+        """Test that is_circular mask is accessible."""
+        is_circular = jnp.array([True, False, True, False])
+        dist = MixedUniformBase(is_circular)
+
+        assert jnp.all(dist.is_circular == is_circular)
+
+    def test_all_circular(self):
+        """Test with all dimensions circular."""
+        is_circular = jnp.ones(4, dtype=bool)
+        dist = MixedUniformBase(is_circular)
+
+        key = jr.key(0)
+        samples = dist.sample(key, (100,))
+
+        assert samples.shape == (100, 4)
+        assert jnp.all(samples >= 0.0)
+        assert jnp.all(samples <= 1.0)
+
+    def test_all_linear(self):
+        """Test with all dimensions linear."""
+        is_circular = jnp.zeros(4, dtype=bool)
+        dist = MixedUniformBase(is_circular)
+
+        key = jr.key(0)
+        samples = dist.sample(key, (100,))
+
+        assert samples.shape == (100, 4)
+        assert jnp.all(samples >= 0.0)
+        assert jnp.all(samples <= 1.0)
+
+    def test_boundary_values(self):
+        """Test log_prob at boundary values."""
+        is_circular = jnp.array([True, False])
+        dist = MixedUniformBase(is_circular)
+
+        # At boundaries (should be valid)
+        x_boundary = jnp.array([0.0, 0.0])
+        log_p = dist.log_prob(x_boundary)
+        assert jnp.isfinite(log_p)
+
+        x_boundary = jnp.array([1.0, 1.0])
+        log_p = dist.log_prob(x_boundary)
+        assert jnp.isfinite(log_p)
