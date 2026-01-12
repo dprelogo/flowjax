@@ -7,6 +7,7 @@ from .chain import Chain
 from .circular_coupling import CircularCoupling
 from .circular_masked_autoregressive import CircularMaskedAutoregressive
 from .circular_rational_quadratic_spline import CircularRationalQuadraticSpline
+from .circular_scale import CircularScale
 from .concatenate import Concatenate, Stack
 from .convex_combination import ConvexCombination
 from .coupling import Coupling
@@ -43,6 +44,7 @@ __all__ = [
     "CircularCoupling",
     "CircularMaskedAutoregressive",
     "CircularRationalQuadraticSpline",
+    "CircularScale",
     "Concatenate",
     "ConvexCombination",
     "Coupling",
