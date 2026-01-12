@@ -27,6 +27,7 @@ from flowjax.bijections import (
     CircularCoupling,
     CircularMaskedAutoregressive,
     CircularRationalQuadraticSpline,
+    CircularScale,
     Coupling,
     Flip,
     Invert,
@@ -420,6 +421,7 @@ def circular_masked_autoregressive_flow(
     key: PRNGKeyArray,
     *,
     base_dist: AbstractDistribution,
+    unit_hypercube: bool = False,
     transformer: AbstractBijection | None = None,
     cond_dim: int | None = None,
     flow_layers: int = 8,
@@ -444,6 +446,11 @@ def circular_masked_autoregressive_flow(
         key: Jax random key.
         base_dist: Base distribution on the torus, with ``base_dist.ndim==1``.
             Typically ``TorusUniform(dim)`` for uniform distribution on [0, 2π]^D.
+            When ``unit_hypercube=True``, use ``Uniform(jnp.zeros(dim), jnp.ones(dim))``
+            for uniform distribution on [0, 1]^D.
+        unit_hypercube: If True, the flow operates on [0, 1]^D domain. All
+            dimensions are scaled to [0, 2π] internally for proper circular
+            embeddings, then scaled back to [0, 1] at output. Defaults to False.
         transformer: Scalar bijection (shape=()) to be parameterised by the
             autoregressive network. Defaults to
             :class:`~flowjax.bijections.CircularRationalQuadraticSpline`.
@@ -476,7 +483,19 @@ def circular_masked_autoregressive_flow(
 
     keys = jr.split(key, flow_layers)
     layers = eqx.filter_vmap(make_layer)(keys)
-    bijection = Invert(Scan(layers)) if invert else Scan(layers)
+    bijection = Scan(layers)
+
+    # Wrap with CircularScale for unit hypercube support
+    # For fully circular flows, all dimensions are scaled
+    if unit_hypercube:
+        is_circular = jnp.ones(dim, dtype=bool)  # All dims are circular
+        scale_in = CircularScale(is_circular, forward_to_2pi=True)
+        scale_out = CircularScale(is_circular, forward_to_2pi=False)
+        bijection = Chain([scale_in, bijection, scale_out]).merge_chains()
+
+    if invert:
+        bijection = Invert(bijection)
+
     return Transformed(base_dist, bijection)
 
 
@@ -485,6 +504,7 @@ def mixed_masked_autoregressive_flow(
     *,
     base_dist: AbstractDistribution,
     is_circular: Array,
+    unit_hypercube: bool = False,
     linear_bounds: tuple[float, float] = (-5.0, 5.0),
     linear_boundary_derivatives: float | None = 1.0,
     linear_transformer_kwargs: dict | None = None,
@@ -526,10 +546,16 @@ def mixed_masked_autoregressive_flow(
             **Recommended**: Use ``MixedBase(is_circular)`` for numerical stability
             (StandardNormal for R dims, Uniform for T dims). ``MixedUniform`` may
             cause ``-inf`` log_prob when samples map slightly outside bounds.
+            When ``unit_hypercube=True``, use ``MixedUniformBase(is_circular)`` instead.
         is_circular: Boolean array indicating which dimensions are circular.
             Length must match base_dist.shape[-1].
+        unit_hypercube: If True, the flow operates on [0, 1]^D domain. Circular
+            dimensions are internally scaled to [0, 2π] for proper circular embeddings,
+            then scaled back to [0, 1] at output. Use with ``MixedUniformBase`` and
+            ``linear_bounds=(0.0, 1.0)`` for best results. Defaults to False.
         linear_bounds: Bounds for linear dimensions (used in RationalQuadraticSpline).
-            Defaults to (-5.0, 5.0).
+            Defaults to (-5.0, 5.0). **Important**: When using ``unit_hypercube=True``,
+            set this to ``(0.0, 1.0)`` to match the [0, 1] data domain.
         linear_boundary_derivatives: Fixed boundary derivative value for linear
             transformers. Use 1.0 for C1 continuity with identity tails (default),
             or None to learn boundary derivatives freely. Defaults to 1.0.
@@ -683,6 +709,18 @@ def mixed_masked_autoregressive_flow(
 
     # Chain all layers
     bijection = Chain(layers) if len(layers) > 1 else layers[0]
+
+    # Wrap with CircularScale for unit hypercube support
+    # This scales circular dims [0,1] <-> [0,2π] at flow boundaries
+    # IMPORTANT: scale_out must use the FINAL topology mask after all permutations
+    if unit_hypercube:
+        # scale_in uses original is_circular (input dimension ordering)
+        scale_in = CircularScale(is_circular, forward_to_2pi=True)
+        # scale_out uses final topology mask (output dimension ordering after permutations)
+        final_topology = topology_masks[-1]
+        scale_out = CircularScale(final_topology, forward_to_2pi=False)
+        bijection = Chain([scale_in, bijection, scale_out]).merge_chains()
+
     if invert:
         bijection = Invert(bijection)
 
