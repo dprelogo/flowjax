@@ -42,6 +42,42 @@ class MaximumLikelihoodLoss:
         return -dist.log_prob(x, condition).mean()
 
 
+class WeightedMaximumLikelihoodLoss:
+    """Weighted negative log-likelihood loss for importance-weighted samples.
+
+    This loss computes the weighted mean of the negative log-likelihood,
+    useful when training on samples with importance weights.
+    """
+
+    @eqx.filter_jit
+    def __call__(
+        self,
+        params: AbstractDistribution,
+        static: AbstractDistribution,
+        x: Array,
+        weights: Array,
+        condition: Array | None = None,
+        key: PRNGKeyArray | None = None,
+    ) -> Float[Array, ""]:
+        """Compute the weighted loss.
+
+        Args:
+            params: Trainable parameters of the distribution.
+            static: Static (non-trainable) parts of the distribution.
+            x: Samples of shape (n, dim).
+            weights: Importance weights of shape (n,). Should be normalized to sum to 1.
+            condition: Optional conditioning variables. Defaults to None.
+            key: Random key (ignored, for API consistency). Defaults to None.
+
+        Returns:
+            Weighted negative log-likelihood.
+        """
+        dist = paramax.unwrap(eqx.combine(params, static))
+        log_probs = dist.log_prob(x, condition)
+        # Weighted mean negative log likelihood
+        return -jnp.sum(weights * log_probs) / jnp.sum(weights)
+
+
 class ContrastiveLoss:
     r"""Loss function for use in a sequential neural posterior estimation algorithm.
 
