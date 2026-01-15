@@ -222,7 +222,7 @@ def fit_to_data_with_iterator(
     key: PRNGKeyArray,
     dist: PyTree,
     train_iterator: Iterable,
-    val_data: ArrayLike,
+    val_data: ArrayLike | None = None,
     *,
     loss_fn: Callable | None = None,
     val_loss_fn: Callable | None = None,
@@ -238,7 +238,7 @@ def fit_to_data_with_iterator(
 
     This is a variant of :func:`fit_to_data` that accepts:
     - A custom iterator for training data (e.g., for iteration-aware batching)
-    - Explicit validation data (not automatically split from training)
+    - Optional explicit validation data (not automatically split from training)
 
     This is useful when you need custom control over how training batches are
     generated, such as stratified sampling or iteration-aware batching in
@@ -251,7 +251,9 @@ def fit_to_data_with_iterator(
             should be a tuple of arrays or a single array. The iterator should
             support being called multiple times (once per epoch). If it has a
             `key` attribute, it will be updated each epoch for fresh randomness.
-        val_data: Validation data array for early stopping. Shape (n_val, ...).
+        val_data: Optional validation data array for early stopping. Shape
+            (n_val, ...). If None or empty, validation and early stopping are
+            disabled, and training runs for exactly max_epochs.
         learning_rate: The learning rate for adam optimizer. Ignored if optimizer
             is provided.
         optimizer: Optax optimizer. Defaults to None.
@@ -262,16 +264,17 @@ def fit_to_data_with_iterator(
             weights (for weighted training), but validation uses unweighted loss.
         max_epochs: Maximum number of epochs. Defaults to 100.
         max_patience: Number of consecutive epochs with no validation loss improvement
-            after which training is terminated. Defaults to 5.
+            after which training is terminated. Ignored if val_data is None.
         batch_size: Batch size for validation data. Defaults to 100.
         return_best: Whether the result should use the parameters where the minimum
-            loss was reached (when True), or the parameters after the last update
-            (when False). Defaults to True.
+            validation loss was reached (when True), or the parameters after the
+            last update (when False). Ignored if val_data is None (always uses
+            final parameters). Defaults to True.
         show_progress: Whether to show progress bar. Defaults to True.
 
     Returns:
         A tuple containing the trained distribution and the losses dict with
-        'train' and 'val' keys.
+        'train' key (and 'val' key if validation data was provided).
 
     Example:
         >>> # Custom iterator that yields batches
@@ -284,17 +287,17 @@ def fit_to_data_with_iterator(
         ...             yield self.data[i:i+self.batch_size]
         ...
         >>> train_loader = MyDataLoader(train_samples, batch_size=64)
+        >>> # With validation
         >>> dist, losses = fit_to_data_with_iterator(
         ...     key, dist, train_loader, val_samples
+        ... )
+        >>> # Without validation (train for fixed epochs)
+        >>> dist, losses = fit_to_data_with_iterator(
+        ...     key, dist, train_loader, max_epochs=50
         ... )
     """
     if loss_fn is None:
         loss_fn = MaximumLikelihoodLoss()
-
-    # Validation always uses unweighted loss (MaximumLikelihoodLoss)
-    # because validation data doesn't have weights
-    if val_loss_fn is None:
-        val_loss_fn = MaximumLikelihoodLoss()
 
     if optimizer is None:
         optimizer = optax.adam(learning_rate)
@@ -307,10 +310,21 @@ def fit_to_data_with_iterator(
     best_params = params
     opt_state = optimizer.init(params)
 
-    # Prepare validation data
-    val_data = jnp.asarray(val_data)
-    val_arrays = [val_data]
-    losses = {"train": [], "val": []}
+    # Determine if we have validation data
+    use_validation = val_data is not None
+    if use_validation:
+        val_data = jnp.asarray(val_data)
+        use_validation = val_data.shape[0] > 0  # Check for empty array
+
+    if use_validation:
+        # Validation uses unweighted loss (MaximumLikelihoodLoss)
+        # because validation data doesn't have weights
+        if val_loss_fn is None:
+            val_loss_fn = MaximumLikelihoodLoss()
+        val_arrays = [val_data]
+        losses = {"train": [], "val": []}
+    else:
+        losses = {"train": []}
 
     loop = tqdm(range(max_epochs), disable=not show_progress)
 
@@ -348,32 +362,38 @@ def fit_to_data_with_iterator(
             # Handle empty epoch (shouldn't happen normally)
             losses["train"].append(float("nan"))
 
-        # Val epoch - shuffle and batch validation data
-        # Note: use val_loss_fn which is always unweighted (validation data has no weights)
-        val_arrays_shuffled = [jr.permutation(val_key, a) for a in val_arrays]
-        batch_losses = []
-        for batch in zip(*get_batches(val_arrays_shuffled, batch_size), strict=True):
-            key, subkey = jr.split(key)
-            loss_i = eqx.filter_jit(val_loss_fn)(params, static, *batch, key=subkey)
-            batch_losses.append(loss_i)
+        if use_validation:
+            # Val epoch - shuffle and batch validation data
+            # Note: use val_loss_fn which is always unweighted
+            val_arrays_shuffled = [jr.permutation(val_key, a) for a in val_arrays]
+            batch_losses = []
+            for batch in zip(*get_batches(val_arrays_shuffled, batch_size), strict=True):
+                key, subkey = jr.split(key)
+                loss_i = eqx.filter_jit(val_loss_fn)(params, static, *batch, key=subkey)
+                batch_losses.append(loss_i)
 
-        if batch_losses:
-            losses["val"].append((sum(batch_losses) / len(batch_losses)).item())
+            if batch_losses:
+                losses["val"].append((sum(batch_losses) / len(batch_losses)).item())
+            else:
+                # Handle case where val set is smaller than batch_size
+                # Evaluate on full validation set
+                key, subkey = jr.split(key)
+                loss_i = eqx.filter_jit(val_loss_fn)(params, static, val_data, key=subkey)
+                losses["val"].append(loss_i.item())
+
+            loop.set_postfix({k: v[-1] for k, v in losses.items()})
+
+            if losses["val"][-1] == min(losses["val"]):
+                best_params = params
+            elif count_fruitless(losses["val"]) > max_patience:
+                loop.set_postfix_str(f"{loop.postfix} (Max patience reached)")
+                break
         else:
-            # Handle case where val set is smaller than batch_size
-            # Evaluate on full validation set
-            key, subkey = jr.split(key)
-            loss_i = eqx.filter_jit(val_loss_fn)(params, static, val_data, key=subkey)
-            losses["val"].append(loss_i.item())
+            # No validation - just show training loss
+            loop.set_postfix({"train": losses["train"][-1]})
 
-        loop.set_postfix({k: v[-1] for k, v in losses.items()})
-
-        if losses["val"][-1] == min(losses["val"]):
-            best_params = params
-        elif count_fruitless(losses["val"]) > max_patience:
-            loop.set_postfix_str(f"{loop.postfix} (Max patience reached)")
-            break
-
-    params = best_params if return_best else params
+    # Use best params only if validation was used and return_best is True
+    if use_validation and return_best:
+        params = best_params
     dist = eqx.combine(params, static)
     return dist, losses
