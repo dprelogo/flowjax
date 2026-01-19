@@ -313,15 +313,20 @@ def fit_to_data_with_iterator(
     # Determine if we have validation data
     use_validation = val_data is not None
     if use_validation:
-        val_data = jnp.asarray(val_data)
-        use_validation = val_data.shape[0] > 0  # Check for empty array
+        # Handle both single array and tuple of arrays for validation
+        if isinstance(val_data, tuple):
+            val_arrays = [jnp.asarray(a) for a in val_data]
+            use_validation = val_arrays[0].shape[0] > 0
+        else:
+            val_data = jnp.asarray(val_data)
+            val_arrays = [val_data]
+            use_validation = val_data.shape[0] > 0  # Check for empty array
 
     if use_validation:
         # Validation uses unweighted loss (MaximumLikelihoodLoss)
         # because validation data doesn't have weights
         if val_loss_fn is None:
             val_loss_fn = MaximumLikelihoodLoss()
-        val_arrays = [val_data]
         losses = {"train": [], "val": []}
     else:
         losses = {"train": []}
@@ -378,7 +383,7 @@ def fit_to_data_with_iterator(
                 # Handle case where val set is smaller than batch_size
                 # Evaluate on full validation set
                 key, subkey = jr.split(key)
-                loss_i = eqx.filter_jit(val_loss_fn)(params, static, val_data, key=subkey)
+                loss_i = eqx.filter_jit(val_loss_fn)(params, static, *val_arrays, key=subkey)
                 losses["val"].append(loss_i.item())
 
             loop.set_postfix({k: v[-1] for k, v in losses.items()})
