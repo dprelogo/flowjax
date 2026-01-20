@@ -3,6 +3,7 @@
 from collections.abc import Sequence
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.tree_util import tree_leaves, tree_map
@@ -98,12 +99,16 @@ def arraylike_to_array(
     (float, int) etc, but does not allow list or tuple inputs (which are not arraylike
     and can introduce overhead and confusing behaviour in certain cases).
 
+    Also accepts JAX tracer objects (e.g., BatchTracer, JVPTracer) to support
+    tracing through vmap, jit, and other JAX transformations.
+
     Args:
         arr: Arraylike input to convert to a JAX array.
         err_name: Name of the input in the error message. Defaults to "input".
         **kwargs: Keyword arguments passed to jnp.asarray.
     """
-    if not isinstance(arr, ArrayLike):
+    # Accept both ArrayLike types and JAX tracers (for vmap/jit compatibility)
+    if not isinstance(arr, (ArrayLike, jax.core.Tracer)):
         raise TypeError(
             f"Expected {err_name} to be arraylike; got {type(arr).__name__}.",
         )
