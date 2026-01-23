@@ -51,3 +51,4 @@ articles/*
 CLAUDE.md
 .mcp*
 *.png
+uv.lock
